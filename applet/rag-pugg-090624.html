@@ -1,0 +1,531 @@
+<!-- Code used to create the Glia engagement applet for the RAG Pugg project -->
+<html>
+  <head>
+    <script src="https://libs.glia.com/axon.js"></script>
+    <style>
+      .conversation-turn {
+        background-color: rgb(182, 218, 230);
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+      }
+      .suggestion {
+        background-color: rgb(179, 193, 198);
+        padding: 10px;
+        margin: 5px;
+        border-radius: 5px;
+      }
+    </style>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  </head>
+  <body>
+    <script>
+      const operatorLabel = 'operator';
+      const visitorLabel = 'visitor';
+      // List of visitor messages for which suggestions were requested
+      const visitorMsgWithSuggestions = [];
+      // List of conversation turns for which possible intents were generated
+      // Conversation turn is identified by the ID of the last message in the turn
+      const conversationTurnsWithIntents = [];
+
+      // For some reason, sometimes EVENTS.CHAT_MESSAGES is emitted multiple (3) times
+      // so let's store the ID of the last processed message and skip processing events
+      // which have the same last message ID
+      const eventsProcessed = [];
+      const baseUrl = 'https://ef38-35-171-55-213.ngrok-free.app/api/v1';
+      /**
+        Creates a div element to display chat messages. If the div already exists,
+        clears it. Returns the created or existing div.
+      */
+      function createChatMessagesDiv() {
+        var messagesDiv = document.getElementById('chat-messages');
+        if (!messagesDiv) {
+          messagesDiv = document.createElement('div');
+          messagesDiv.setAttribute('id', 'chat-messages');
+          messagesDiv.setAttribute('style', 'padding: 10px;');
+          document.body.appendChild(messagesDiv);
+        } else {
+          messagesDiv.innerHTML = ''; // Clear existing messages
+        }
+        return messagesDiv;
+      }
+
+      /**
+        Removes duplicates from an array of objects based on the 'id' field
+      */
+      function removeDuplicates(array) {
+        const seenIds = new Set();
+        return array.filter(item => {
+            if (seenIds.has(item.id)) {
+                return false;
+            } else {
+                seenIds.add(item.id);
+                return true;
+            }
+        });
+      }
+
+      /*
+        Removes messages based on custom rules, namely if:
+        a) sender.type=system or omniguide (OA messages),
+        b) sender.type=operator & sender.name=qa-chat-stg-va
+        c) temporary: visitor message "human"
+        (current bot name)
+        AND returns only the id, content and sender fields
+        08-27-24. Some weird magic is happening here. Sometimes in the messages array
+        I'm getting all messages twice
+      */
+      function filterMessages(messages) {
+        const currBotName = 'qa-chat-stg-va';
+        const filtered = [];
+        messages.forEach((msg) => {
+          if (
+            (msg?.sender?.type !== 'system' && msg?.sender?.type !== 'omniguide')
+          && !(
+            msg?.sender?.type === 'operator'
+            && msg?.sender?.name === currBotName)
+          && msg?.content !== 'human'
+          && !(
+            msg?.sender?.type === 'operator'
+            && msg?.content === 'Default Hello')) {
+            filtered.push(msg);
+          }
+        });
+        console.log('Filtered messages, before unification:', filtered);
+        const uniqueMessages = removeDuplicates(filtered);
+        console.log('Unique filtered messages:', uniqueMessages);
+        return uniqueMessages.map((msg) => ({
+          id: msg.id,
+          content: msg.content,
+          sender: msg.sender,
+        }));
+      }
+
+      /**
+        Divides conversation into "conversation turns" - blocks of messages
+        composed of visitor's message(s) followed by operator's message(s). E.g.
+        (visitor - V, operator - O):
+        [O, V, O, V, V, O, V, O, O, V, V, O, O] -> [[O], [V, O], [V, V, O], [V, O, O], [V, V, O, O]]
+      */
+      function divideIntoConversationTurns(messages) {
+        let blocks = [];
+        let currentBlock = [];
+        let inBlock = false;
+        messages.forEach((element) => {
+          const senderType = element?.sender?.type;
+          if (senderType === visitorLabel) {
+            // If we are not in a block, start a new block
+            if (!inBlock) {
+              inBlock = true;
+              currentBlock = [element];
+            } else {
+              // If the previous message is from visitor - add element to the current block
+              if (currentBlock[currentBlock.length - 1]?.sender?.type === visitorLabel) {
+                currentBlock.push(element);
+              } else {
+                // If the previous element is from operator - push the current block and start a new block
+                blocks.push(currentBlock);
+                currentBlock = [element];
+              }
+            }
+          } else if (senderType === operatorLabel) {
+            // if we are in a block - add element to the current block
+            if (inBlock) {
+              currentBlock.push(element);
+            } else {
+              // Push the operator's message directly to the resulting array in a separate array block
+              // inBlock = false;
+              blocks.push([element]);
+            }
+          }
+        });
+        if (currentBlock.length > 0) {
+          blocks.push(currentBlock);
+        }
+        return blocks;
+      }
+
+      /**
+        Checks if a conversation turn contains both visitor and operator messages.
+        Returns true if it does, false otherwise.
+      */
+      function containsBothVisitorAndOperatorMsg(conversationTurn) {
+        const hasVisitor = conversationTurn.some(obj => obj?.sender?.type === visitorLabel);
+        const hasOperator = conversationTurn.some(obj => obj?.sender?.type === operatorLabel);
+        return hasVisitor && hasOperator;
+      }
+
+      /**
+        Checks if an intent was already generated for a conversation turn (conversation turn is
+        identified by the ID of the last message in the turn). Returns the intent if it was, undefined otherwise.
+      */
+      function intentWasGeneratedForConversationTurn(conversationTurn) {
+        const conversationTurnId = conversationTurn[conversationTurn.length - 1]?.id;
+        console.log(`Looking for intent with ID ${conversationTurnId} in conversationTurnsWithIntents`, conversationTurnsWithIntents);
+        return conversationTurnsWithIntents.find(obj => obj.id === conversationTurnId);
+      }
+
+      /**
+        Checks if response suggestion was already generated for a visitor message
+        Returns the suggestion if it was, undefined otherwise.
+      */
+      function suggestionWasGeneratedForVisitorMsg(visitorMsg) {
+        const { id } = visitorMsg;
+        console.log(`Looking for suggestion for message with ID ${id}`);
+        return visitorMsgWithSuggestions.find(obj => obj.id === id);
+      }
+
+      /**
+        Intent data is stored as an object with the following structure:
+        {
+          visitorPrompts: ['prompt1', 'prompt2', ...],
+          operatorResponse: 'response'
+        }
+        Returns a string with the intent data formatted for displaying in the applet
+      */
+      function prepareIntentForPrint(intentData) {
+        return 'Possible new intent:<br>' +
+        `Visitor prompts:<br>${intentData?.visitorPrompts?.join('<br>')}<br>` +
+        `Operator response:<br>${intentData?.operatorResponse}`;
+      }
+
+      /**
+        Prepares the conversation turn for displaying in the applet
+        Returns a string composed of visitor and operator messages, joined with <br> tag
+      */
+      function prepareConversationTurnForPrint(convTurn) {
+        return convTurn.map(obj => {
+          return `${obj?.sender?.type?.toUpperCase()}: ${obj?.content}`;
+        }).join('<br>');
+      }
+
+      const hasObjectWithId = (arr, id) => arr.some(obj => obj.id === id);
+      /**
+        Pushes the intent data to the conversationTurnsWithIntents array.
+        The intent data is stored as an object with the following structure:
+        {
+          id: 'id', // ID of the last message in the conversation turn
+          intent: {
+            visitorPrompts: ['prompt1', 'prompt2', ...],
+            operatorResponse: 'response'
+          }
+        }
+      */
+      function pushIntentToConversationTurnsWithIntents(id, intentData) {
+        const existingIntentIds = conversationTurnsWithIntents.map(obj => obj.id);
+        if (existingIntentIds.includes(id)) {
+          console.log('Intent already exists for the conversation turn with the ID:', id);
+          return;
+        }
+        conversationTurnsWithIntents.push({
+          id,
+          intent: intentData,
+        });
+      }
+
+      /**
+        Creates a card element with the intent data.
+        The intent data is stored as an object with the following structure:
+        {
+          visitorPrompts: ['prompt1', 'prompt2', ...],
+          operatorResponse: ''
+        }
+      */
+      const createIntentCard = async (intentData) => {
+        const intentCard = document.createElement('div');
+        intentCard.className = 'card text-bg-light mb-3';
+        intentCard.style.maxWidth = '32rem';
+        intentCard.style.fontSize = '12px';
+
+        const cardBody1 = document.createElement('div');
+        cardBody1.className = 'card-body p-2';
+
+        const visitorTitle = document.createElement('h6');
+        visitorTitle.className = 'card-title medium';
+        visitorTitle.style.fontSize = '13px';
+        visitorTitle.innerText = 'Visitor utterance variations:';
+        cardBody1.appendChild(visitorTitle);
+
+        // Create a text area for visitor utterance variations
+        const visitorTextArea = document.createElement('textarea');
+        visitorTextArea.className = 'form-control';
+        visitorTextArea.style.width = '100%';
+        visitorTextArea.style.height = '100px';
+        visitorTextArea.style.fontSize = '13px';
+        visitorTextArea.value = intentData.visitorPrompts.join(' :: ');
+        cardBody1.appendChild(visitorTextArea);
+
+        const operatorTitle = document.createElement('h6');
+        operatorTitle.className = 'card-title';
+        operatorTitle.style.fontSize = '13px';
+        operatorTitle.innerText = 'Operator\'s response:';
+        cardBody1.appendChild(operatorTitle);
+
+        // Create a text area for operator's response
+        const operatorTextArea = document.createElement('textarea');
+        operatorTextArea.className = 'form-control';
+        operatorTextArea.style.width = '100%';
+        operatorTextArea.style.height = '50px';
+        operatorTextArea.style.fontSize = '13px';
+        operatorTextArea.value = intentData.operatorResponse;
+        cardBody1.appendChild(operatorTextArea);
+
+        const cardBody2 = document.createElement('div');
+        cardBody2.className = 'card-body p-2';
+
+        const saveIntentButton = document.createElement('a');
+        saveIntentButton.href = '#';
+        saveIntentButton.className = 'btn btn-primary btn-sm';
+        saveIntentButton.innerText = 'Save intent';
+        saveIntentButton.addEventListener('click', async function(event) {
+          event.preventDefault();
+          console.log('Sending intent to the server...');
+          try {
+            const updatedIntentData = {
+              visitorPrompts: visitorTextArea.value.split(' :: '),
+              operatorResponse: operatorTextArea.value
+            };
+            const saveIntentConfig = {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(updatedIntentData)
+            };
+            console.log('Save intent config:', saveIntentConfig, JSON.stringify(updatedIntentData), baseUrl);
+            const response = await fetch(`${baseUrl}/save-intent`, saveIntentConfig);
+            const data = await response.json();
+            console.log('Response data:', data);
+
+            // Create and display the "Done" label
+            const doneLabel = document.createElement('span');
+            doneLabel.className = 'done-label';
+            doneLabel.style.marginLeft = '10px';
+            doneLabel.style.color = 'green';
+            doneLabel.innerText = 'Saved';
+            cardBody2.appendChild(doneLabel);
+          } catch (error) {
+            console.error('Save intent error:', error);
+          }
+        });
+
+        cardBody2.appendChild(saveIntentButton);
+        intentCard.appendChild(cardBody1);
+        intentCard.appendChild(cardBody2);
+        return intentCard;
+      };
+
+      const renderSuggestion = (suggestionForTheLastVisitorMsg) => {
+        const suggestionCard = document.createElement('div');
+        suggestionCard.className = 'card bg-success-subtle text-success-emphasis mb-3';
+        suggestionCard.style.maxWidth = '32rem';
+        suggestionCard.style.fontSize = '13px';
+
+        const cardBody1 = document.createElement('div');
+        cardBody1.className = 'card-body p-2';
+
+          // Create a text area for the suggestion
+        const suggestionTextArea = document.createElement('textarea');
+        suggestionTextArea.className = 'form-control';
+        suggestionTextArea.style.width = '100%';
+        suggestionTextArea.style.height = '50px';
+        suggestionTextArea.style.fontSize = '13px';
+        suggestionTextArea.value = suggestionForTheLastVisitorMsg.suggestion.context;
+
+        // Add the score badge
+        const scoreBadge = document.createElement('span');
+        scoreBadge.className = 'badge text-bg-secondary';
+        scoreBadge.innerText = `Score: ${suggestionForTheLastVisitorMsg?.suggestion?.score?.toFixed(2)}`;
+
+        cardBody1.appendChild(suggestionTextArea);
+        cardBody1.appendChild(scoreBadge);
+
+        const cardBody2 = document.createElement('div');
+        cardBody2.className = 'card-body p-2';
+
+        const sendSuggestionButton = document.createElement('a');
+        sendSuggestionButton.href = '#';
+        sendSuggestionButton.className = 'btn btn-success btn-sm';
+        sendSuggestionButton.innerHTML = 'Send to chat';
+        sendSuggestionButton.addEventListener('click', async function(event) {
+          event.preventDefault();
+          console.log('Sending suggestion to the chat...');
+          try {
+            const glia = await getGliaApi({ version: 'v1' });
+            await glia.sendChatMessage({
+              content: suggestionTextArea.value, // Send the contents of the text area
+            });
+          } catch (error) {
+            console.error('Error:', error);
+          }
+        });
+
+        cardBody2.appendChild(sendSuggestionButton);
+        suggestionCard.appendChild(cardBody1);
+        suggestionCard.appendChild(cardBody2);
+        return suggestionCard;
+      }
+
+      /**
+        The main handler of events emitted by addBufferedEventListener().
+        Filters messages, divides them into conversation turns, and processes each turn
+        (generates and displays the possible intent with button click handler), if
+        the last message is from visitor, tries to get and display a suggestion for it
+      */
+      async function getChatMessages(messages) {
+        const messagesDiv = createChatMessagesDiv();
+        console.log('Received messages:', messages);
+
+        const filteredMessages = filterMessages(messages);
+        console.log('Filtered messages:', filteredMessages);
+
+        const conversationTurns = divideIntoConversationTurns(filteredMessages);
+        console.log('Conversation turns:', conversationTurns);
+
+        for (const element of conversationTurns) {
+          console.log('Conversation turn: ', JSON.stringify(element));
+
+          const conversationTurnDiv = document.createElement('div');
+          conversationTurnDiv.className = 'card text-bg-light mb-3';
+          conversationTurnDiv.style.maxWidth = '48rem';
+          conversationTurnDiv.style.fontSize = '13px';
+          conversationTurnDiv.setAttribute('style', 'padding: 10px;');
+
+          const convTurnTexts = document.createElement('div');
+          convTurnTexts.className = 'card text-bg-light mb-3';
+          convTurnTexts.style.maxWidth = '32rem';
+          convTurnTexts.style.fontSize = '12px';
+          convTurnTexts.setAttribute('style', 'padding: 10px;');
+          const conversationTurnForPrint =  prepareConversationTurnForPrint(element);
+          console.log('conversationTurn4Print', conversationTurnForPrint);
+          convTurnTexts.innerHTML = conversationTurnForPrint;
+          conversationTurnDiv.appendChild(convTurnTexts);
+
+          try {
+            const validConversationTurn = containsBothVisitorAndOperatorMsg(element);
+
+            if (validConversationTurn) {
+              console.log(`Turn contains both visitor and operator messages`);
+
+              const intentDiv = document.createElement('div');
+              const intentGenerated = intentWasGeneratedForConversationTurn(element);
+              let intentCardData;
+
+              if (intentGenerated) {
+                console.log('Intent already exists: ', intentGenerated);
+                intentCardData = await createIntentCard(intentGenerated.intent);
+              } else {
+                console.log('Calling /generate-intent with ', JSON.stringify(element));
+
+                try {
+                  const response = await fetch(`${baseUrl}/generate-intent`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(element)
+                  });
+                  const intentData = await response.json();
+                  intentCardData = await createIntentCard(intentData);
+                  pushIntentToConversationTurnsWithIntents(element[element.length - 1].id, intentData);
+                  console.log(`Added intent ${JSON.stringify(intentData)} to conversationTurnsWithIntents: `, conversationTurnsWithIntents);
+                } catch (error) {
+                  console.error('Error:', error);
+                }
+              }
+              intentDiv.appendChild(intentCardData);
+              conversationTurnDiv.appendChild(intentDiv);
+            }
+          } catch (error) {
+            console.log('Error rendering conversation turn:', error);
+          }
+          messagesDiv.appendChild(conversationTurnDiv);
+        }
+
+        // If the last message in the chat is from visitor and suggestion was not
+        // requested for it yet, try doing it and display the suggestion
+        const theLastMessage = filteredMessages[filteredMessages.length - 1];
+        const {
+          id: msgId = '',
+          content = '',
+          sender: {
+            type: senderType = '',
+          } = {},
+        } = theLastMessage ?? {};
+
+        console.log('Checking if to request suggestion: ', msgId, content, senderType, visitorMsgWithSuggestions);
+
+        if (senderType === visitorLabel) {
+          let suggestionForTheLastVisitorMsg = suggestionWasGeneratedForVisitorMsg(theLastMessage);
+          let suggestionData;
+
+          if (!suggestionForTheLastVisitorMsg) {
+            // Request a suggestion for the message
+            console.log(`Requesting suggestion for the message id ${msgId}: `, content);
+
+            try {
+              const response = await fetch(`${baseUrl}/suggestion`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(theLastMessage)
+              });
+              suggestionData = await response.json();
+              console.log(`Received suggestion for the message id ${msgId}: `, suggestionData);
+
+              // Add the message id to the list of messages with suggestions
+              console.log('Adding suggestion for the message ID: ', msgId);
+              suggestionForTheLastVisitorMsg = {
+                id: msgId,
+                suggestion: suggestionData,
+              }
+              visitorMsgWithSuggestions.push(suggestionForTheLastVisitorMsg);
+            } catch (error) {
+              console.error('Error:', error);
+            }
+          } else {
+            console.log(`Suggestion already exists for the message ID: ${msgId}`, suggestionForTheLastVisitorMsg);
+          }
+
+          if (suggestionData) {
+            const suggestionCard = renderSuggestion(suggestionForTheLastVisitorMsg);
+            messagesDiv.appendChild(suggestionCard);
+          }
+        } else {
+          console.log('The last message is not from the visitor');
+        }
+      }
+
+      (async () => {
+        try {
+          const glia = await window.getGliaApi({ version: 'v1' });
+          console.log('Adding glia.addBufferedEventListener');
+
+          glia.addBufferedEventListener(glia.EVENTS.CHAT_MESSAGES, async (messages) => {
+            const currentTimestamp = new Date().toLocaleString();
+            console.log(`Event emitted: CHAT_MESSAGES, Timestamp: ${currentTimestamp}`);
+
+            // Another mystery - for some reason I'm getting 3 events emitted for
+            // every operator message, adding an ugly workaround to process only the 1st one
+            const lastMessageId = messages[messages.length - 1]?.id;
+            if (eventsProcessed.includes(lastMessageId)) {
+              console.log('Event already processed, skipping...');
+              return;
+            }
+            if (!eventsProcessed.includes(lastMessageId)) {
+              eventsProcessed.push(lastMessageId);
+            }
+
+            console.log('Processing event, last message ID is:', lastMessageId);
+            await getChatMessages(messages);
+          });
+
+        } catch (error) {
+          console.error('Error getting Glia API:', error);
+        }
+      })();
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+  </body>
+</html>
