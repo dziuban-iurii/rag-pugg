@@ -1,4 +1,6 @@
-# RAG-PUGG Operator Assistant backend app
+# RAG-PUGG Operator Assistant
+Please see the [slides](https://docs.google.com/presentation/d/14SqufG2Jv_cuL8Po5Lm99rRCpG-yZiaVCRyTCyHUYHM/edit?usp=sharing) and the [4-min demo](https://www.youtube.com/watch?v=g6tWvemziTg).
+
 This is a fork of my earlier [RAG application](https://github.com/IuriiD/ai24support-openai-pinecone-rag), adapted to the RAG-PUGG project prepared for the Glia's "Hacko de Septo" hackathon (Sep 05-06, 2024).
 
 It uses OpenAI [Embeddings](https://platform.openai.com/docs/api-reference/embeddings) and [Chat Completion](https://platform.openai.com/docs/api-reference/chat) API + [Pinecone](https://www.pinecone.io/) vector DB.
